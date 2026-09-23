@@ -1,0 +1,140 @@
+name: Build Signed Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Find ZIP file
+        shell: bash
+        run: |
+          ZIP_FILE=$(find . -maxdepth 2 -type f -iname "*.zip" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No ZIP file found."
+            exit 1
+          fi
+
+          echo "ZIP found: $ZIP_FILE"
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
+
+      - name: Extract Android project
+        shell: bash
+        run: |
+          rm -rf extracted
+          mkdir extracted
+
+          unzip -q "$ZIP_FILE" -d extracted
+
+          echo "Extracted files:"
+          find extracted -maxdepth 3 -type f | head -100
+
+      - name: Find Gradle project
+        shell: bash
+        run: |
+          PROJECT_DIR=$(find extracted -type f -name "settings.gradle" -o -name "settings.gradle.kts" | head -n 1)
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "Gradle project was not found."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$PROJECT_DIR")
+
+          echo "Android project:"
+          echo "$PROJECT_DIR"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          cd "$PROJECT_DIR"
+
+          mkdir -p keystore
+
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > keystore/release.keystore
+
+            cat > keystore.properties <<EOF
+          storeFile=keystore/release.keystore
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+            echo "Signing configuration created from repository secrets."
+
+          elif [ -f "keystore/release.keystore" ] && [ -f "keystore.properties" ]; then
+            echo "Existing signing configuration found."
+
+          else
+            echo "No release keystore was found."
+            echo "Release APK cannot be safely signed."
+            exit 1
+          fi
+
+      - name: Make Gradle executable
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+          else
+            echo "gradlew was not found."
+            exit 1
+          fi
+
+      - name: Build signed Release APK
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+
+          ./gradlew clean assembleRelease --no-daemon
+
+      - name: Find APK
+        shell: bash
+        run: |
+          APK=$(find "$PROJECT_DIR/app/build/outputs/apk/release" \
+            -type f \
+            -name "*.apk" \
+            | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "Release APK was not created."
+            exit 1
+          fi
+
+          echo "APK created:"
+          echo "$APK"
+
+          mkdir -p "$GITHUB_WORKSPACE/final-apk"
+          cp "$APK" "$GITHUB_WORKSPACE/final-apk/app-release.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: final-apk/app-release.apk
+          if-no-files-found: error
